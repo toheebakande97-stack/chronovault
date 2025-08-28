@@ -75,3 +75,172 @@
     loyalty-multiplier: uint
   }
 )
+
+
+;; public functions
+
+;; Mint a new genesis NFT
+(define-public (mint-genesis (recipient principal) (base-traits (string-ascii 1024)) (uri (string-ascii 256)))
+  (let
+    (
+      (token-id (+ (var-get last-token-id) u1))
+      (current-block burn-block-height)
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (try! (nft-mint? chronovault-nft token-id recipient))
+    (map-set token-data 
+      { token-id: token-id }
+      {
+        creator: tx-sender,
+        birth-block: current-block,
+        generation: u0,
+        parent-1: none,
+        parent-2: none,
+        evolution-level: u0,
+        last-breeding-block: u0,
+        base-traits: base-traits
+      }
+    )
+    (map-set token-uris { token-id: token-id } { uri: uri })
+    (setup-evolution-schedule token-id current-block)
+    (update-holder-stats recipient current-block)
+    (var-set last-token-id token-id)
+    (ok token-id)
+  )
+)
+
+;; Public mint function with payment
+(define-public (mint-paid (base-traits (string-ascii 1024)) (uri (string-ascii 256)))
+  (let
+    (
+      (token-id (+ (var-get last-token-id) u1))
+      (current-block burn-block-height)
+    )
+    (try! (stx-transfer? MINT_PRICE tx-sender CONTRACT_OWNER))
+    (try! (nft-mint? chronovault-nft token-id tx-sender))
+    (map-set token-data 
+      { token-id: token-id }
+      {
+        creator: tx-sender,
+        birth-block: current-block,
+        generation: u0,
+        parent-1: none,
+        parent-2: none,
+        evolution-level: u0,
+        last-breeding-block: u0,
+        base-traits: base-traits
+      }
+    )
+    (map-set token-uris { token-id: token-id } { uri: uri })
+    (setup-evolution-schedule token-id current-block)
+    (update-holder-stats tx-sender current-block)
+    (var-set last-token-id token-id)
+    (ok token-id)
+  )
+)
+
+;; Breed two NFTs to create offspring
+(define-public (breed (parent-1-id uint) (parent-2-id uint) (offspring-traits (string-ascii 1024)) (uri (string-ascii 256)))
+  (let
+    (
+      (parent-1-data (unwrap! (map-get? token-data { token-id: parent-1-id }) ERR_TOKEN_NOT_FOUND))
+      (parent-2-data (unwrap! (map-get? token-data { token-id: parent-2-id }) ERR_TOKEN_NOT_FOUND))
+      (parent-1-owner (unwrap! (nft-get-owner? chronovault-nft parent-1-id) ERR_TOKEN_NOT_FOUND))
+      (parent-2-owner (unwrap! (nft-get-owner? chronovault-nft parent-2-id) ERR_TOKEN_NOT_FOUND))
+      (current-block burn-block-height)
+      (new-token-id (+ (var-get last-token-id) u1))
+      (new-generation (+ (max (get generation parent-1-data) (get generation parent-2-data)) u1))
+    )
+    (asserts! (not (is-eq parent-1-id parent-2-id)) ERR_SAME_PARENT_TOKENS)
+    (asserts! (or (is-eq tx-sender parent-1-owner) (is-eq tx-sender parent-2-owner)) ERR_NOT_TOKEN_OWNER)
+    (asserts! (>= current-block (+ (get birth-block parent-1-data) BREEDING_MATURITY_BLOCKS)) ERR_BREEDING_NOT_READY)
+    (asserts! (>= current-block (+ (get birth-block parent-2-data) BREEDING_MATURITY_BLOCKS)) ERR_BREEDING_NOT_READY)
+    (asserts! (>= current-block (+ (get last-breeding-block parent-1-data) BREEDING_COOLDOWN_BLOCKS)) ERR_BREEDING_COOLDOWN)
+    (asserts! (>= current-block (+ (get last-breeding-block parent-2-data) BREEDING_COOLDOWN_BLOCKS)) ERR_BREEDING_COOLDOWN)
+    
+    (try! (stx-transfer? BREEDING_PRICE tx-sender CONTRACT_OWNER))
+    (try! (nft-mint? chronovault-nft new-token-id tx-sender))
+    
+    ;; Update parent breeding blocks
+    (map-set token-data 
+      { token-id: parent-1-id }
+      (merge parent-1-data { last-breeding-block: current-block })
+    )
+    (map-set token-data 
+      { token-id: parent-2-id }
+      (merge parent-2-data { last-breeding-block: current-block })
+    )
+    
+    ;; Create offspring
+    (map-set token-data 
+      { token-id: new-token-id }
+      {
+        creator: tx-sender,
+        birth-block: current-block,
+        generation: new-generation,
+        parent-1: (some parent-1-id),
+        parent-2: (some parent-2-id),
+        evolution-level: u0,
+        last-breeding-block: u0,
+        base-traits: offspring-traits
+      }
+    )
+    (map-set token-uris { token-id: new-token-id } { uri: uri })
+    (setup-evolution-schedule new-token-id current-block)
+    (update-holder-stats tx-sender current-block)
+    (var-set last-token-id new-token-id)
+    (ok new-token-id)
+  )
+)
+
+;; Trigger evolution for a token
+(define-public (evolve-token (token-id uint))
+  (let
+    (
+      (token-owner (unwrap! (nft-get-owner? chronovault-nft token-id) ERR_TOKEN_NOT_FOUND))
+      (token-info (unwrap! (map-get? token-data { token-id: token-id }) ERR_TOKEN_NOT_FOUND))
+      (current-level (get evolution-level token-info))
+      (next-level (+ current-level u1))
+      (evolution-info (map-get? evolution-schedules { token-id: token-id, evolution-level: next-level }))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_NOT_TOKEN_OWNER)
+    (match evolution-info
+      evolution-data
+      (begin
+        (asserts! (>= burn-block-height (get unlock-block evolution-data)) ERR_BREEDING_NOT_READY)
+        (asserts! (not (get unlocked evolution-data)) ERR_INVALID_TOKEN)
+        (map-set evolution-schedules 
+          { token-id: token-id, evolution-level: next-level }
+          (merge evolution-data { unlocked: true })
+        )
+        (map-set token-data 
+          { token-id: token-id }
+          (merge token-info { evolution-level: next-level })
+        )
+        (ok true)
+      )
+      ERR_TOKEN_NOT_FOUND
+    )
+  )
+)
+
+;; Transfer function
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender sender) ERR_NOT_TOKEN_OWNER)
+    (update-holder-stats recipient burn-block-height)
+    (nft-transfer? chronovault-nft token-id sender recipient)
+  )
+)
+
+;; Set token URI (owner only)
+(define-public (set-token-uri (token-id uint) (uri (string-ascii 256)))
+  (let
+    (
+      (token-owner (unwrap! (nft-get-owner? chronovault-nft token-id) ERR_TOKEN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_NOT_TOKEN_OWNER)
+    (map-set token-uris { token-id: token-id } { uri: uri })
+    (ok true)
+  )
+)
