@@ -76,7 +76,6 @@
   }
 )
 
-
 ;; public functions
 
 ;; Mint a new genesis NFT
@@ -243,4 +242,138 @@
     (map-set token-uris { token-id: token-id } { uri: uri })
     (ok true)
   )
+)
+
+;; read only functions
+
+;; Get last token ID
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id))
+)
+
+;; Get token URI
+(define-read-only (get-token-uri (token-id uint))
+  (ok (get uri (map-get? token-uris { token-id: token-id })))
+)
+
+;; Get token owner
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? chronovault-nft token-id))
+)
+
+;; Get token data
+(define-read-only (get-token-data (token-id uint))
+  (map-get? token-data { token-id: token-id })
+)
+
+;; Get evolution info
+(define-read-only (get-evolution-info (token-id uint) (evolution-level uint))
+  (map-get? evolution-schedules { token-id: token-id, evolution-level: evolution-level })
+)
+
+;; Get current evolution level
+(define-read-only (get-current-evolution-level (token-id uint))
+  (match (map-get? token-data { token-id: token-id })
+    token-info (ok (get evolution-level token-info))
+    ERR_TOKEN_NOT_FOUND
+  )
+)
+
+;; Check if token can breed
+(define-read-only (can-breed (token-id uint))
+  (match (map-get? token-data { token-id: token-id })
+    token-info
+    (let
+      (
+        (current-block burn-block-height)
+        (maturity-block (+ (get birth-block token-info) BREEDING_MATURITY_BLOCKS))
+        (cooldown-block (+ (get last-breeding-block token-info) BREEDING_COOLDOWN_BLOCKS))
+      )
+      (ok (and (>= current-block maturity-block) (>= current-block cooldown-block)))
+    )
+    ERR_TOKEN_NOT_FOUND
+  )
+)
+
+;; Get holder stats
+(define-read-only (get-holder-stats (holder principal))
+  (map-get? holder-stats { holder: holder })
+)
+
+;; Get contract URI
+(define-read-only (get-contract-uri)
+  (ok (some (var-get contract-uri)))
+)
+
+;; private functions
+
+;; Setup evolution schedule for a token
+(define-private (setup-evolution-schedule (token-id uint) (birth-block uint))
+  (begin
+    ;; Set up first 5 evolution levels
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u1 }
+      { unlock-block: (+ birth-block BLOCKS_PER_EVOLUTION), new-traits: "basic-growth", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u2 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u2)), new-traits: "enhanced-features", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u3 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u3)), new-traits: "rare-attributes", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u4 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u4)), new-traits: "legendary-powers", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u5 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u5)), new-traits: "mythical-essence", unlocked: false }
+    )
+    true
+  )
+)
+
+;; Update holder statistics
+(define-private (update-holder-stats (holder principal) (current-block uint))
+  (let
+    (
+      (existing-stats (map-get? holder-stats { holder: holder }))
+    )
+    (match existing-stats
+      stats
+      (map-set holder-stats 
+        { holder: holder }
+        (merge stats { total-breeding-count: (+ (get total-breeding-count stats) u1) })
+      )
+      (map-set holder-stats 
+        { holder: holder }
+        {
+          first-hold-block: current-block,
+          total-breeding-count: u0,
+          loyalty-multiplier: u100
+        }
+      )
+    )
+  )
+)
+
+;; Calculate loyalty multiplier based on holding duration
+(define-private (calculate-loyalty-multiplier (first-hold-block uint) (current-block uint))
+  (let
+    (
+      (holding-duration (- current-block first-hold-block))
+      (base-multiplier u100)
+    )
+    (if (>= holding-duration BREEDING_MATURITY_BLOCKS)
+      (+ base-multiplier (/ holding-duration u10000))
+      base-multiplier
+    )
+  )
+)
+
+;; Get maximum of two uints
+(define-private (max (a uint) (b uint))
+  (if (> a b) a b)
 )
