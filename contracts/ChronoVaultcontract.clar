@@ -76,7 +76,6 @@
   }
 )
 
-
 ;; public functions
 
 ;; Mint a new genesis NFT
@@ -245,7 +244,6 @@
   )
 )
 
-
 ;; read only functions
 
 ;; Get last token ID
@@ -305,4 +303,77 @@
 ;; Get contract URI
 (define-read-only (get-contract-uri)
   (ok (some (var-get contract-uri)))
+)
+
+;; private functions
+
+;; Setup evolution schedule for a token
+(define-private (setup-evolution-schedule (token-id uint) (birth-block uint))
+  (begin
+    ;; Set up first 5 evolution levels
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u1 }
+      { unlock-block: (+ birth-block BLOCKS_PER_EVOLUTION), new-traits: "basic-growth", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u2 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u2)), new-traits: "enhanced-features", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u3 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u3)), new-traits: "rare-attributes", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u4 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u4)), new-traits: "legendary-powers", unlocked: false }
+    )
+    (map-set evolution-schedules 
+      { token-id: token-id, evolution-level: u5 }
+      { unlock-block: (+ birth-block (* BLOCKS_PER_EVOLUTION u5)), new-traits: "mythical-essence", unlocked: false }
+    )
+    true
+  )
+)
+
+;; Update holder statistics
+(define-private (update-holder-stats (holder principal) (current-block uint))
+  (let
+    (
+      (existing-stats (map-get? holder-stats { holder: holder }))
+    )
+    (match existing-stats
+      stats
+      (map-set holder-stats 
+        { holder: holder }
+        (merge stats { total-breeding-count: (+ (get total-breeding-count stats) u1) })
+      )
+      (map-set holder-stats 
+        { holder: holder }
+        {
+          first-hold-block: current-block,
+          total-breeding-count: u0,
+          loyalty-multiplier: u100
+        }
+      )
+    )
+  )
+)
+
+;; Calculate loyalty multiplier based on holding duration
+(define-private (calculate-loyalty-multiplier (first-hold-block uint) (current-block uint))
+  (let
+    (
+      (holding-duration (- current-block first-hold-block))
+      (base-multiplier u100)
+    )
+    (if (>= holding-duration BREEDING_MATURITY_BLOCKS)
+      (+ base-multiplier (/ holding-duration u10000))
+      base-multiplier
+    )
+  )
+)
+
+;; Get maximum of two uints
+(define-private (max (a uint) (b uint))
+  (if (> a b) a b)
 )
