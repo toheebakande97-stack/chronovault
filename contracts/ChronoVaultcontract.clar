@@ -27,16 +27,31 @@
 (define-constant ERR_INVALID_TOKEN (err u105))
 (define-constant ERR_BREEDING_COOLDOWN (err u106))
 (define-constant ERR_SAME_PARENT_TOKENS (err u107))
+(define-constant ERR_CONTRACT_PAUSED (err u108))
+(define-constant ERR_OVERFLOW (err u109))
+(define-constant ERR_UNDERFLOW (err u110))
+(define-constant ERR_INVALID_INPUT (err u111))
+(define-constant ERR_RATE_LIMIT (err u112))
+(define-constant ERR_MAX_GENERATION (err u113))
+(define-constant ERR_MAX_EVOLUTION (err u114))
+(define-constant ERR_REENTRANCY (err u115))
 
 (define-constant BLOCKS_PER_EVOLUTION u10000)
 (define-constant BREEDING_MATURITY_BLOCKS u100000)
 (define-constant BREEDING_COOLDOWN_BLOCKS u50000)
 (define-constant MINT_PRICE u1000000) ;; 1 STX in microSTX
 (define-constant BREEDING_PRICE u500000) ;; 0.5 STX in microSTX
+(define-constant MAX_GENERATION u10) ;; Maximum generation depth
+(define-constant MAX_EVOLUTION_LEVEL u5) ;; Maximum evolution level
+(define-constant MIN_TRAIT_LENGTH u10) ;; Minimum trait string length
+(define-constant MAX_TRAIT_LENGTH u1024) ;; Maximum trait string length
+(define-constant OPERATION_COOLDOWN u10) ;; Blocks between operations per user
 
 ;; data vars
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-ascii 256) "https://chronovault.app/metadata/contract")
+(define-data-var contract-paused bool false)
+(define-data-var reentrancy-guard bool false)
 
 ;; data maps
 (define-map token-data 
@@ -76,17 +91,142 @@
   }
 )
 
+(define-map user-last-operation
+  { user: principal }
+  { last-block: uint }
+)
+
+;; Security helper functions
+
+;; Safe math - addition with overflow check
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (if (< result a)
+      ERR_OVERFLOW
+      (ok result)
+    )
+  )
+)
+
+;; Safe math - subtraction with underflow check
+(define-private (safe-sub (a uint) (b uint))
+  (if (< a b)
+    ERR_UNDERFLOW
+    (ok (- a b))
+  )
+)
+
+;; Safe math - multiplication with overflow check
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (if (and (> a u0) (< result a))
+      ERR_OVERFLOW
+      (ok result)
+    )
+  )
+)
+
+;; Reentrancy guard - acquire lock
+(define-private (acquire-reentrancy-lock)
+  (if (var-get reentrancy-guard)
+    ERR_REENTRANCY
+    (begin
+      (var-set reentrancy-guard true)
+      (ok true)
+    )
+  )
+)
+
+;; Reentrancy guard - release lock
+(define-private (release-reentrancy-lock)
+  (begin
+    (var-set reentrancy-guard false)
+    true
+  )
+)
+
+;; Check if contract is paused
+(define-private (check-not-paused)
+  (if (var-get contract-paused)
+    ERR_CONTRACT_PAUSED
+    (ok true)
+  )
+)
+
+;; Validate trait string length
+(define-private (validate-trait-length (traits (string-ascii 1024)))
+  (let ((length (len traits)))
+    (if (and (>= length MIN_TRAIT_LENGTH) (<= length MAX_TRAIT_LENGTH))
+      (ok true)
+      ERR_INVALID_INPUT
+    )
+  )
+)
+
+;; Check rate limit for user operations
+(define-private (check-rate-limit (user principal))
+  (let (
+    (last-op (map-get? user-last-operation { user: user }))
+    (current-block burn-block-height)
+  )
+    (match last-op
+      op-data
+      (if (>= current-block (+ (get last-block op-data) OPERATION_COOLDOWN))
+        (ok true)
+        ERR_RATE_LIMIT
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Update user operation timestamp
+(define-private (update-operation-timestamp (user principal))
+  (begin
+    (map-set user-last-operation 
+      { user: user }
+      { last-block: burn-block-height }
+    )
+    true
+  )
+)
+
 ;; public functions
+
+;; Pause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+;; Unpause contract (owner only)
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 ;; Mint a new genesis NFT
 (define-public (mint-genesis (recipient principal) (base-traits (string-ascii 1024)) (uri (string-ascii 256)))
   (let
     (
-      (token-id (+ (var-get last-token-id) u1))
+      (token-id (try! (safe-add (var-get last-token-id) u1)))
       (current-block burn-block-height)
     )
+    ;; Security checks
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (try! (validate-trait-length base-traits))
+    
+    ;; Mint NFT
     (try! (nft-mint? chronovault-nft token-id recipient))
+    
+    ;; Set token data
     (map-set token-data 
       { token-id: token-id }
       {
@@ -112,11 +252,19 @@
 (define-public (mint-paid (base-traits (string-ascii 1024)) (uri (string-ascii 256)))
   (let
     (
-      (token-id (+ (var-get last-token-id) u1))
+      (token-id (try! (safe-add (var-get last-token-id) u1)))
       (current-block burn-block-height)
     )
-    (try! (stx-transfer? MINT_PRICE tx-sender CONTRACT_OWNER))
+    ;; Security checks
+    (try! (check-not-paused))
+    (try! (acquire-reentrancy-lock))
+    (try! (check-rate-limit tx-sender))
+    (try! (validate-trait-length base-traits))
+    
+    ;; Mint NFT first (state changes before external calls)
     (try! (nft-mint? chronovault-nft token-id tx-sender))
+    
+    ;; Set token data
     (map-set token-data 
       { token-id: token-id }
       {
@@ -133,8 +281,20 @@
     (map-set token-uris { token-id: token-id } { uri: uri })
     (setup-evolution-schedule token-id current-block)
     (update-holder-stats tx-sender current-block)
+    (update-operation-timestamp tx-sender)
     (var-set last-token-id token-id)
-    (ok token-id)
+    
+    ;; Payment after state changes (reentrancy protection)
+    (match (stx-transfer? MINT_PRICE tx-sender CONTRACT_OWNER)
+      success (begin
+        (release-reentrancy-lock)
+        (ok token-id)
+      )
+      error (begin
+        (release-reentrancy-lock)
+        (err error)
+      )
+    )
   )
 )
 
@@ -147,17 +307,29 @@
       (parent-1-owner (unwrap! (nft-get-owner? chronovault-nft parent-1-id) ERR_TOKEN_NOT_FOUND))
       (parent-2-owner (unwrap! (nft-get-owner? chronovault-nft parent-2-id) ERR_TOKEN_NOT_FOUND))
       (current-block burn-block-height)
-      (new-token-id (+ (var-get last-token-id) u1))
-      (new-generation (+ (max (get generation parent-1-data) (get generation parent-2-data)) u1))
+      (new-token-id (try! (safe-add (var-get last-token-id) u1)))
+      (new-generation (try! (safe-add (max (get generation parent-1-data) (get generation parent-2-data)) u1)))
+      (maturity-block-1 (try! (safe-add (get birth-block parent-1-data) BREEDING_MATURITY_BLOCKS)))
+      (maturity-block-2 (try! (safe-add (get birth-block parent-2-data) BREEDING_MATURITY_BLOCKS)))
+      (cooldown-block-1 (try! (safe-add (get last-breeding-block parent-1-data) BREEDING_COOLDOWN_BLOCKS)))
+      (cooldown-block-2 (try! (safe-add (get last-breeding-block parent-2-data) BREEDING_COOLDOWN_BLOCKS)))
     )
+    ;; Security checks
+    (try! (check-not-paused))
+    (try! (acquire-reentrancy-lock))
+    (try! (check-rate-limit tx-sender))
+    (try! (validate-trait-length offspring-traits))
+    
+    ;; Validation checks
     (asserts! (not (is-eq parent-1-id parent-2-id)) ERR_SAME_PARENT_TOKENS)
     (asserts! (or (is-eq tx-sender parent-1-owner) (is-eq tx-sender parent-2-owner)) ERR_NOT_TOKEN_OWNER)
-    (asserts! (>= current-block (+ (get birth-block parent-1-data) BREEDING_MATURITY_BLOCKS)) ERR_BREEDING_NOT_READY)
-    (asserts! (>= current-block (+ (get birth-block parent-2-data) BREEDING_MATURITY_BLOCKS)) ERR_BREEDING_NOT_READY)
-    (asserts! (>= current-block (+ (get last-breeding-block parent-1-data) BREEDING_COOLDOWN_BLOCKS)) ERR_BREEDING_COOLDOWN)
-    (asserts! (>= current-block (+ (get last-breeding-block parent-2-data) BREEDING_COOLDOWN_BLOCKS)) ERR_BREEDING_COOLDOWN)
+    (asserts! (<= new-generation MAX_GENERATION) ERR_MAX_GENERATION)
+    (asserts! (>= current-block maturity-block-1) ERR_BREEDING_NOT_READY)
+    (asserts! (>= current-block maturity-block-2) ERR_BREEDING_NOT_READY)
+    (asserts! (>= current-block cooldown-block-1) ERR_BREEDING_COOLDOWN)
+    (asserts! (>= current-block cooldown-block-2) ERR_BREEDING_COOLDOWN)
     
-    (try! (stx-transfer? BREEDING_PRICE tx-sender CONTRACT_OWNER))
+    ;; Mint NFT and update state first (before payment)
     (try! (nft-mint? chronovault-nft new-token-id tx-sender))
     
     ;; Update parent breeding blocks
@@ -187,8 +359,20 @@
     (map-set token-uris { token-id: new-token-id } { uri: uri })
     (setup-evolution-schedule new-token-id current-block)
     (update-holder-stats tx-sender current-block)
+    (update-operation-timestamp tx-sender)
     (var-set last-token-id new-token-id)
-    (ok new-token-id)
+    
+    ;; Payment after state changes (reentrancy protection)
+    (match (stx-transfer? BREEDING_PRICE tx-sender CONTRACT_OWNER)
+      success (begin
+        (release-reentrancy-lock)
+        (ok new-token-id)
+      )
+      error (begin
+        (release-reentrancy-lock)
+        (err error)
+      )
+    )
   )
 )
 
@@ -199,10 +383,14 @@
       (token-owner (unwrap! (nft-get-owner? chronovault-nft token-id) ERR_TOKEN_NOT_FOUND))
       (token-info (unwrap! (map-get? token-data { token-id: token-id }) ERR_TOKEN_NOT_FOUND))
       (current-level (get evolution-level token-info))
-      (next-level (+ current-level u1))
+      (next-level (try! (safe-add current-level u1)))
       (evolution-info (map-get? evolution-schedules { token-id: token-id, evolution-level: next-level }))
     )
+    ;; Security checks
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender token-owner) ERR_NOT_TOKEN_OWNER)
+    (asserts! (<= next-level MAX_EVOLUTION_LEVEL) ERR_MAX_EVOLUTION)
+    
     (match evolution-info
       evolution-data
       (begin
@@ -226,7 +414,11 @@
 ;; Transfer function
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
   (begin
+    ;; Security checks
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender sender) ERR_NOT_TOKEN_OWNER)
+    
+    ;; Update stats and transfer
     (update-holder-stats recipient burn-block-height)
     (nft-transfer? chronovault-nft token-id sender recipient)
   )
@@ -303,6 +495,48 @@
 ;; Get contract URI
 (define-read-only (get-contract-uri)
   (ok (some (var-get contract-uri)))
+)
+
+;; NEW SECURITY READ-ONLY FUNCTIONS
+
+;; Check if contract is paused
+(define-read-only (is-contract-paused)
+  (ok (var-get contract-paused))
+)
+
+;; Check if reentrancy guard is active
+(define-read-only (is-reentrancy-locked)
+  (ok (var-get reentrancy-guard))
+)
+
+;; Get user's last operation block
+(define-read-only (get-user-last-operation (user principal))
+  (map-get? user-last-operation { user: user })
+)
+
+;; Check if user can perform operation (rate limit check)
+(define-read-only (can-user-operate (user principal))
+  (let (
+    (last-op (map-get? user-last-operation { user: user }))
+    (current-block burn-block-height)
+  )
+    (match last-op
+      op-data
+      (ok (>= current-block (+ (get last-block op-data) OPERATION_COOLDOWN)))
+      (ok true)
+    )
+  )
+)
+
+;; Get security status
+(define-read-only (get-security-status)
+  {
+    contract-paused: (var-get contract-paused),
+    reentrancy-locked: (var-get reentrancy-guard),
+    max-generation: MAX_GENERATION,
+    max-evolution-level: MAX_EVOLUTION_LEVEL,
+    operation-cooldown: OPERATION_COOLDOWN
+  }
 )
 
 ;; private functions
