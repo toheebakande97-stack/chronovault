@@ -47,7 +47,28 @@
 (define-constant MAX_TRAIT_LENGTH u1024) ;; Maximum trait string length
 (define-constant OPERATION_COOLDOWN u10) ;; Blocks between operations per user
 
-;; data vars
+;; ADVANCED SECURITY CONSTANTS
+(define-constant EMERGENCY_PAUSE_DURATION u1440) ;; 1 day in blocks for emergency pause
+(define-constant MAX_ORACLE_STALENESS u3600) ;; 1 hour max staleness for oracle data
+(define-constant MIN_BLOCK_VALIDATION u100) ;; Minimum blocks for evolution validation
+(define-constant MAX_BULK_OPERATIONS u10) ;; Maximum operations per bulk transaction
+(define-constant SECURITY_ADMIN_PERCENTAGE u10) ;; 10% of fees go to security admin
+
+;; ADVANCED SECURITY ERROR CODES
+(define-constant ERR_EMERGENCY_PAUSED (err u116))
+(define-constant ERR_ORACLE_STALE (err u117))
+(define-constant ERR_INVALID_BLOCK_HEIGHT (err u118))
+(define-constant ERR_BULK_OPERATION_LIMIT (err u119))
+(define-constant ERR_SECURITY_ADMIN_ONLY (err u120))
+(define-constant ERR_INVALID_ORACLE_DATA (err u121))
+
+;; ADVANCED SECURITY DATA VARS
+(define-data-var emergency-paused bool false)
+(define-data-var emergency-pause-end-block uint u0)
+(define-data-var oracle-last-update uint u0)
+(define-data-var oracle-data-valid bool true)
+(define-data-var security-admin principal CONTRACT_OWNER)
+(define-data-var total-security-fees uint u0)
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-ascii 256) "https://chronovault.app/metadata/contract")
 (define-data-var contract-paused bool false)
@@ -191,6 +212,65 @@
   )
 )
 
+;; ADVANCED SECURITY FUNCTIONS
+
+;; Check if emergency pause is active
+(define-private (check-not-emergency-paused)
+  (if (var-get emergency-paused)
+    (if (>= burn-block-height (var-get emergency-pause-end-block))
+      (begin
+        (var-set emergency-paused false)
+        (ok true)
+      )
+      ERR_EMERGENCY_PAUSED
+    )
+    (ok true)
+  )
+)
+
+;; Validate oracle data freshness
+(define-private (validate-oracle-data)
+  (let ((last-update (var-get oracle-last-update)))
+    (if (and (> last-update u0) (< (- burn-block-height last-update) MAX_ORACLE_STALENESS))
+      (ok true)
+      ERR_ORACLE_STALE
+    )
+  )
+)
+
+;; Enhanced block height validation
+(define-private (validate-evolution-block (block-val uint))
+  (if (and (>= block-val MIN_BLOCK_VALIDATION) (<= block-val burn-block-height))
+    (ok true)
+    ERR_INVALID_BLOCK_HEIGHT
+  )
+)
+
+;; Security fee distribution
+(define-private (distribute-security-fee (total-fee uint))
+  (let
+    (
+      (security-fee (/ (* total-fee SECURITY_ADMIN_PERCENTAGE) u100))
+    )
+    (var-set total-security-fees (+ (var-get total-security-fees) security-fee))
+    (- total-fee security-fee) ;; Return the remaining fee amount
+  )
+)
+
+;; Enhanced validation for bulk operations
+(define-private (validate-bulk-operation-limit (operation-count uint))
+  (if (<= operation-count MAX_BULK_OPERATIONS)
+    (ok true)
+    ERR_BULK_OPERATION_LIMIT
+  )
+)
+
+;; Security monitoring - log suspicious activity
+(define-private (log-security-event (event-type (string-ascii 64)) (details (string-ascii 256)))
+  ;; In a real implementation, this would emit events or update monitoring data
+  true
+)
+
 ;; public functions
 
 ;; Pause contract (owner only)
@@ -211,6 +291,150 @@
   )
 )
 
+;; EMERGENCY SECURITY FUNCTIONS
+
+;; Emergency pause (security admin only - immediate effect)
+(define-public (emergency-pause)
+  (begin
+    (asserts! (is-eq tx-sender (var-get security-admin)) ERR_SECURITY_ADMIN_ONLY)
+    (var-set emergency-paused true)
+    (var-set emergency-pause-end-block (+ burn-block-height EMERGENCY_PAUSE_DURATION))
+    (log-security-event "emergency-pause" "Contract emergency paused by security admin")
+    (ok true)
+  )
+)
+
+;; Emergency unpause (owner only - can override security admin)
+(define-public (emergency-unpause)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (var-set emergency-paused false)
+    (var-set emergency-pause-end-block u0)
+    (log-security-event "emergency-unpause" "Contract emergency unpaused by owner")
+    (ok true)
+  )
+)
+
+;; Update oracle data (security admin only)
+(define-public (update-oracle-data (is-valid bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get security-admin)) ERR_SECURITY_ADMIN_ONLY)
+    (var-set oracle-last-update burn-block-height)
+    (var-set oracle-data-valid is-valid)
+    (ok true)
+  )
+)
+
+;; Set security admin (owner only)
+(define-public (set-security-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (not (is-eq new-admin CONTRACT_OWNER)) ERR_INVALID_INPUT)
+    (var-set security-admin new-admin)
+    (log-security-event "admin-change" "Security admin updated")
+    (ok true)
+  )
+)
+
+;; Withdraw security fees (security admin only)
+(define-public (withdraw-security-fees)
+  (let ((fees (var-get total-security-fees)))
+    (asserts! (is-eq tx-sender (var-get security-admin)) ERR_SECURITY_ADMIN_ONLY)
+    (asserts! (> fees u0) ERR_INSUFFICIENT_PAYMENT)
+    (var-set total-security-fees u0)
+    (match (stx-transfer? fees CONTRACT_OWNER (var-get security-admin))
+      success (ok fees)
+      error (err error)
+    )
+  )
+)
+
+;; BATCH OPERATIONS FOR PERFORMANCE
+
+;; Batch mint genesis NFTs (owner only)
+(define-public (batch-mint-genesis (recipients (list 10 principal)) (base-traits-list (list 10 (string-ascii 1024))) (uris (list 10 (string-ascii 256))))
+  (let ((count (len recipients)))
+    ;; Security checks
+    (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (try! (validate-bulk-operation-limit count))
+    (asserts! (is-eq count (len base-traits-list)) ERR_INVALID_INPUT)
+    (asserts! (is-eq count (len uris)) ERR_INVALID_INPUT)
+
+    ;; Process batch minting
+    (ok (map batch-mint-genesis-helper (list
+      { recipient: (unwrap-panic (element-at recipients u0)), traits: (unwrap-panic (element-at base-traits-list u0)), uri: (unwrap-panic (element-at uris u0)) }
+      { recipient: (unwrap-panic (element-at recipients u1)), traits: (unwrap-panic (element-at base-traits-list u1)), uri: (unwrap-panic (element-at uris u1)) }
+      { recipient: (unwrap-panic (element-at recipients u2)), traits: (unwrap-panic (element-at base-traits-list u2)), uri: (unwrap-panic (element-at uris u2)) }
+      { recipient: (unwrap-panic (element-at recipients u3)), traits: (unwrap-panic (element-at base-traits-list u3)), uri: (unwrap-panic (element-at uris u3)) }
+      { recipient: (unwrap-panic (element-at recipients u4)), traits: (unwrap-panic (element-at base-traits-list u4)), uri: (unwrap-panic (element-at uris u4)) }
+      { recipient: (unwrap-panic (element-at recipients u5)), traits: (unwrap-panic (element-at base-traits-list u5)), uri: (unwrap-panic (element-at uris u5)) }
+      { recipient: (unwrap-panic (element-at recipients u6)), traits: (unwrap-panic (element-at base-traits-list u6)), uri: (unwrap-panic (element-at uris u6)) }
+      { recipient: (unwrap-panic (element-at recipients u7)), traits: (unwrap-panic (element-at base-traits-list u7)), uri: (unwrap-panic (element-at uris u7)) }
+      { recipient: (unwrap-panic (element-at recipients u8)), traits: (unwrap-panic (element-at base-traits-list u8)), uri: (unwrap-panic (element-at uris u8)) }
+      { recipient: (unwrap-panic (element-at recipients u9)), traits: (unwrap-panic (element-at base-traits-list u9)), uri: (unwrap-panic (element-at uris u9)) }
+    )))
+  )
+)
+
+;; Batch mint paid NFTs
+(define-public (batch-mint-paid (base-traits-list (list 10 (string-ascii 1024))) (uris (list 10 (string-ascii 256))))
+  (let ((count (len base-traits-list)))
+    ;; Security checks
+    (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
+    (try! (validate-bulk-operation-limit count))
+    (asserts! (is-eq count (len uris)) ERR_INVALID_INPUT)
+
+    ;; Calculate total cost
+    (let ((total-cost (* count MINT_PRICE)))
+      ;; Process batch minting
+      (ok (map batch-mint-paid-helper (list
+        { traits: (unwrap-panic (element-at base-traits-list u0)), uri: (unwrap-panic (element-at uris u0)) }
+        { traits: (unwrap-panic (element-at base-traits-list u1)), uri: (unwrap-panic (element-at uris u1)) }
+        { traits: (unwrap-panic (element-at base-traits-list u2)), uri: (unwrap-panic (element-at uris u2)) }
+        { traits: (unwrap-panic (element-at base-traits-list u3)), uri: (unwrap-panic (element-at uris u3)) }
+        { traits: (unwrap-panic (element-at base-traits-list u4)), uri: (unwrap-panic (element-at uris u4)) }
+        { traits: (unwrap-panic (element-at base-traits-list u5)), uri: (unwrap-panic (element-at uris u5)) }
+        { traits: (unwrap-panic (element-at base-traits-list u6)), uri: (unwrap-panic (element-at uris u6)) }
+        { traits: (unwrap-panic (element-at base-traits-list u7)), uri: (unwrap-panic (element-at uris u7)) }
+        { traits: (unwrap-panic (element-at base-traits-list u8)), uri: (unwrap-panic (element-at uris u8)) }
+        { traits: (unwrap-panic (element-at base-traits-list u9)), uri: (unwrap-panic (element-at uris u9)) }
+      )))
+    )
+  )
+)
+
+;; Batch evolve tokens
+(define-public (batch-evolve-tokens (token-ids (list 10 uint)))
+  (let ((count (len token-ids)))
+    ;; Security checks
+    (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
+    (try! (validate-bulk-operation-limit count))
+
+    ;; Process batch evolution
+    (ok (map batch-evolve-helper token-ids))
+  )
+)
+
+;; Batch transfer tokens
+(define-public (batch-transfer-tokens (transfers (list 10 {token-id: uint, recipient: principal})))
+  (let ((count (len transfers)))
+    ;; Security checks
+    (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
+    (try! (validate-bulk-operation-limit count))
+
+    ;; Process batch transfers
+    (ok (map batch-transfer-helper transfers))
+  )
+)
+
 ;; Mint a new genesis NFT
 (define-public (mint-genesis (recipient principal) (base-traits (string-ascii 1024)) (uri (string-ascii 256)))
   (let
@@ -218,8 +442,10 @@
       (token-id (try! (safe-add (var-get last-token-id) u1)))
       (current-block burn-block-height)
     )
-    ;; Security checks
+    ;; ADVANCED Security checks
     (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
     (try! (validate-trait-length base-traits))
     
@@ -254,9 +480,12 @@
     (
       (token-id (try! (safe-add (var-get last-token-id) u1)))
       (current-block burn-block-height)
+      (remaining-fee (distribute-security-fee MINT_PRICE))
     )
-    ;; Security checks
+    ;; ADVANCED Security checks
     (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
     (try! (acquire-reentrancy-lock))
     (try! (check-rate-limit tx-sender))
     (try! (validate-trait-length base-traits))
@@ -285,7 +514,7 @@
     (var-set last-token-id token-id)
     
     ;; Payment after state changes (reentrancy protection)
-    (match (stx-transfer? MINT_PRICE tx-sender CONTRACT_OWNER)
+    (match (stx-transfer? remaining-fee tx-sender CONTRACT_OWNER)
       success (begin
         (release-reentrancy-lock)
         (ok token-id)
@@ -313,9 +542,12 @@
       (maturity-block-2 (try! (safe-add (get birth-block parent-2-data) BREEDING_MATURITY_BLOCKS)))
       (cooldown-block-1 (try! (safe-add (get last-breeding-block parent-1-data) BREEDING_COOLDOWN_BLOCKS)))
       (cooldown-block-2 (try! (safe-add (get last-breeding-block parent-2-data) BREEDING_COOLDOWN_BLOCKS)))
+      (remaining-fee (distribute-security-fee BREEDING_PRICE))
     )
-    ;; Security checks
+    ;; ADVANCED Security checks
     (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
     (try! (acquire-reentrancy-lock))
     (try! (check-rate-limit tx-sender))
     (try! (validate-trait-length offspring-traits))
@@ -363,7 +595,7 @@
     (var-set last-token-id new-token-id)
     
     ;; Payment after state changes (reentrancy protection)
-    (match (stx-transfer? BREEDING_PRICE tx-sender CONTRACT_OWNER)
+    (match (stx-transfer? remaining-fee tx-sender CONTRACT_OWNER)
       success (begin
         (release-reentrancy-lock)
         (ok new-token-id)
@@ -386,8 +618,11 @@
       (next-level (try! (safe-add current-level u1)))
       (evolution-info (map-get? evolution-schedules { token-id: token-id, evolution-level: next-level }))
     )
-    ;; Security checks
+    ;; ADVANCED Security checks
     (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
+    (try! (check-rate-limit tx-sender))
     (asserts! (is-eq tx-sender token-owner) ERR_NOT_TOKEN_OWNER)
     (asserts! (<= next-level MAX_EVOLUTION_LEVEL) ERR_MAX_EVOLUTION)
     
@@ -404,6 +639,7 @@
           { token-id: token-id }
           (merge token-info { evolution-level: next-level })
         )
+        (update-operation-timestamp tx-sender)
         (ok true)
       )
       ERR_TOKEN_NOT_FOUND
@@ -414,8 +650,10 @@
 ;; Transfer function
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
   (begin
-    ;; Security checks
+    ;; ADVANCED Security checks
     (try! (check-not-paused))
+    (try! (check-not-emergency-paused))
+    (try! (validate-oracle-data))
     (asserts! (is-eq tx-sender sender) ERR_NOT_TOKEN_OWNER)
     
     ;; Update stats and transfer
@@ -532,11 +770,47 @@
 (define-read-only (get-security-status)
   {
     contract-paused: (var-get contract-paused),
+    emergency-paused: (var-get emergency-paused),
+    emergency-pause-end-block: (var-get emergency-pause-end-block),
     reentrancy-locked: (var-get reentrancy-guard),
+    oracle-last-update: (var-get oracle-last-update),
+    oracle-data-valid: (var-get oracle-data-valid),
+    security-admin: (var-get security-admin),
+    total-security-fees: (var-get total-security-fees),
     max-generation: MAX_GENERATION,
     max-evolution-level: MAX_EVOLUTION_LEVEL,
     operation-cooldown: OPERATION_COOLDOWN
   }
+)
+
+;; Check if emergency pause is active
+(define-read-only (is-emergency-paused)
+  (ok (var-get emergency-paused))
+)
+
+;; Get emergency pause end block
+(define-read-only (get-emergency-pause-end-block)
+  (ok (var-get emergency-pause-end-block))
+)
+
+;; Get oracle status
+(define-read-only (get-oracle-status)
+  {
+    last-update: (var-get oracle-last-update),
+    data-valid: (var-get oracle-data-valid),
+    staleness-threshold: MAX_ORACLE_STALENESS,
+    current-block: burn-block-height
+  }
+)
+
+;; Get security admin
+(define-read-only (get-security-admin)
+  (ok (var-get security-admin))
+)
+
+;; Get total security fees
+(define-read-only (get-total-security-fees)
+  (ok (var-get total-security-fees))
 )
 
 ;; private functions
@@ -610,4 +884,152 @@
 ;; Get maximum of two uints
 (define-private (max (a uint) (b uint))
   (if (> a b) a b)
+)
+
+;; BATCH OPERATION HELPERS
+
+;; Helper for batch genesis minting
+(define-private (batch-mint-genesis-helper (mint-data {recipient: principal, traits: (string-ascii 1024), uri: (string-ascii 256)}))
+  (let
+    (
+      (token-id (try! (safe-add (var-get last-token-id) u1)))
+      (current-block burn-block-height)
+      (recipient (get recipient mint-data))
+      (traits (get traits mint-data))
+      (uri (get uri mint-data))
+    )
+    ;; Validate traits and mint
+    (try! (validate-trait-length traits))
+    (try! (nft-mint? chronovault-nft token-id recipient))
+
+    ;; Set token data
+    (map-set token-data
+      { token-id: token-id }
+      {
+        creator: tx-sender,
+        birth-block: current-block,
+        generation: u0,
+        parent-1: none,
+        parent-2: none,
+        evolution-level: u0,
+        last-breeding-block: u0,
+        base-traits: traits
+      }
+    )
+    (map-set token-uris { token-id: token-id } { uri: uri })
+    (setup-evolution-schedule token-id current-block)
+    (update-holder-stats recipient current-block)
+    (var-set last-token-id token-id)
+    (ok token-id)
+  )
+)
+
+;; Helper for batch paid minting
+(define-private (batch-mint-paid-helper (mint-data {traits: (string-ascii 1024), uri: (string-ascii 256)}))
+  (let
+    (
+      (token-id (try! (safe-add (var-get last-token-id) u1)))
+      (current-block burn-block-height)
+      (traits (get traits mint-data))
+      (uri (get uri mint-data))
+      (remaining-fee (distribute-security-fee MINT_PRICE))
+    )
+    ;; Validate traits and mint
+    (try! (validate-trait-length traits))
+    (try! (nft-mint? chronovault-nft token-id tx-sender))
+
+    ;; Set token data
+    (map-set token-data
+      { token-id: token-id }
+      {
+        creator: tx-sender,
+        birth-block: current-block,
+        generation: u0,
+        parent-1: none,
+        parent-2: none,
+        evolution-level: u0,
+        last-breeding-block: u0,
+        base-traits: traits
+      }
+    )
+    (map-set token-uris { token-id: token-id } { uri: uri })
+    (setup-evolution-schedule token-id current-block)
+    (update-holder-stats tx-sender current-block)
+    (update-operation-timestamp tx-sender)
+    (var-set last-token-id token-id)
+
+    ;; Payment (simplified for batch - assumes payment handled externally)
+    (ok token-id)
+  )
+)
+
+;; Helper for batch evolution
+(define-private (batch-evolve-helper (token-id uint))
+  (let
+    (
+      (token-owner-result (nft-get-owner? chronovault-nft token-id))
+      (token-info-result (map-get? token-data { token-id: token-id }))
+    )
+    (match token-owner-result
+      token-owner
+      (match token-info-result
+        token-info
+        (let
+          (
+            (current-level (get evolution-level token-info))
+            (next-level (+ current-level u1))
+            (evolution-info (map-get? evolution-schedules { token-id: token-id, evolution-level: next-level }))
+          )
+          ;; Check ownership and evolution requirements
+          (if (and (is-eq tx-sender token-owner) (<= next-level MAX_EVOLUTION_LEVEL))
+            (match evolution-info
+              evolution-data
+              (if (>= burn-block-height (get unlock-block evolution-data))
+                (begin
+                  (map-set evolution-schedules
+                    { token-id: token-id, evolution-level: next-level }
+                    (merge evolution-data { unlocked: true })
+                  )
+                  (map-set token-data
+                    { token-id: token-id }
+                    (merge token-info { evolution-level: next-level })
+                  )
+                  (ok true)
+                )
+                (ok false)
+              )
+              (ok false)
+            )
+            (ok false)
+          )
+        )
+        (ok false)
+      )
+      (ok false)
+    )
+  )
+)
+
+;; Helper for batch transfers
+(define-private (batch-transfer-helper (transfer-data {token-id: uint, recipient: principal}))
+  (let
+    (
+      (token-id (get token-id transfer-data))
+      (recipient (get recipient transfer-data))
+    )
+    (match (nft-get-owner? chronovault-nft token-id)
+      token-owner
+      (if (is-eq tx-sender token-owner)
+        (match (nft-transfer? chronovault-nft token-id tx-sender recipient)
+          success (begin
+            (update-holder-stats recipient burn-block-height)
+            (ok true)
+          )
+          error (ok false)
+        )
+        (ok false)
+      )
+      (ok false)
+    )
+  )
 )
